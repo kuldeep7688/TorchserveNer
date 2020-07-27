@@ -12,24 +12,20 @@ logger = logging.getLogger(__name__)
 
 def list_classes_from_module(module, parent_class=None):
     """
-    Parse user defined module to get all the model service classes in it.
-    Args:
-        module
-        parent_class
-    Returns:
-        list: list of model service class definitions
+    Parse user defined module to get all model service classes in it.
+    :param module:
+    :param parent_class:
+    :return: List of model service class definitions
     """
-    # parsing the module to get all defined classes
-    classes = [
-        cls[1]
-        for cls in inspect.getmembers(
-            module,
-            lambda member: inspect.isclass(member) and member.__module__ == module.__name__
-        )
-    ]
+
+    # Parsing the module to get all defined classes
+    classes = [cls[1] for cls in inspect.getmembers(module, lambda member: inspect.isclass(member) and
+                                                    member.__module__ == module.__name__)]
     # filter classes that is subclass of parent_class
     if parent_class is not None:
         return [c for c in classes if issubclass(c, parent_class)]
+
+    return classes
 
 
 def _is_whitespace(c):
@@ -108,7 +104,7 @@ class NERTorchServeHandler:
         self.initialized = False
         self.manifest = None
 
-    def initialized(self, ctx):
+    def initialize(self, ctx):
         self.manifest = ctx.manifest
         properties = ctx.system_properties
         model_dir = properties.get("model_dir")
@@ -119,11 +115,11 @@ class NERTorchServeHandler:
         serialized_file = self.manifest['model']['serializedFile']
 
         # model def file and other model related files
-        model_file = self.manifest['manifest']['modelFile']
+        model_file = self.manifest['model']['modelFile']
         model_def_path = os.path.join(model_dir, model_file)
         model_vocab_path = os.path.join(model_dir, 'vocab.txt')
         model_bert_config_path = os.path.join(model_dir, "bert_config.json")
-        model_config_path = os.path.join(model_dir, "bert_for_token_classification.json")
+        model_config_path = os.path.join(model_dir, "bert_for_token_classification_config.json")
         labels_file_path = os.path.join(model_dir, "labels_file.txt")
 
         # loading model config file
@@ -134,6 +130,7 @@ class NERTorchServeHandler:
             self.max_seq_length = self.model_config_dict['max_seq_length']
             self.num_special_tokens = self.model_config_dict['num_special_tokens']
         else:
+            print("model_config_path doesnt exists.")
             logger.debug("model_config_path doesnt exists.")
 
         # loading labels
@@ -142,6 +139,7 @@ class NERTorchServeHandler:
             self.label2idx = {l: i for i, l in enumerate(self.labels)}
             self.idx2label = {i: l for i, l in enumerate(self.labels)}
         else:
+            print("labels_file_path doesnt exists.")
             logger.debug("labels_file_path doesnt exists.")
 
         # loading bert config file
@@ -150,6 +148,7 @@ class NERTorchServeHandler:
                 model_bert_config_path
             )
         else:
+            print("bert config path doesnt exists.")
             logger.debug("bert config path doesnt exists.")
 
         # loading bert tokenizer
@@ -159,11 +158,12 @@ class NERTorchServeHandler:
                 do_lower_case=True # I used do_lower_case=True during training so here also True
             )
         else:
+            print("vocab path doesnt exists.")
             logger.debug("vocab path doesnt exists.")
 
         # loading model weigths into definitions
         if os.path.isfile(model_def_path):
-            module = importlib.import_module(model_file.split(",")[0])
+            module = importlib.import_module(model_file.split(".")[0])
             model_class_definitions = list_classes_from_module(module)
             if len(model_class_definitions) != 1:
                 raise ValueError("Expected only one class as model definition. {}".format(model_class_definitions))
@@ -176,6 +176,7 @@ class NERTorchServeHandler:
                 classification_layer_sizes=self.model_config_dict["classification_layer_sizes"]
             )
         else:
+            print("No model class found")
             logger.debug("No model class found")
 
         self.model.to(self.device)
@@ -255,6 +256,7 @@ class NERTorchServeHandler:
         return aligned_ner_labels
 
     def preprocess(self, data):
+        print(data)
         text = data[0].get("data")
         if text is None:
             text = data[0].get("body")
@@ -344,7 +346,7 @@ _service = NERTorchServeHandler()
 
 def handle(data, context):
     if not _service.initialized:
-        _service.initialized(context)
+        _service.initialize(context)
 
     if data is None:
         return None
