@@ -1,9 +1,7 @@
 import logging
 import os
 import json
-import numpy as np
 import torch
-import torch.nn as nn
 import importlib
 import inspect
 from transformers import BertTokenizer, BertConfig
@@ -111,7 +109,7 @@ class NERTorchServeHandler:
         self.manifest = None
 
     def initialized(self, ctx):
-        self.manifest = manifest
+        self.manifest = ctx.manifest
         properties = ctx.system_properties
         model_dir = properties.get("model_dir")
         # self.device = torch.device("cuda:" + str(properties.get("gpu_id")) if torch.cuda.is_availabel() else "cpu")
@@ -140,7 +138,7 @@ class NERTorchServeHandler:
 
         # loading labels
         if os.path.isfile(labels_file_path):
-            self.labels = get_labels(labels_file_path)
+            self.labels = get_labels(labels_file_path) + ["<PAD>"]
             self.label2idx = {l: i for i, l in enumerate(self.labels)}
             self.idx2label = {i: l for i, l in enumerate(self.labels)}
         else:
@@ -204,8 +202,8 @@ class NERTorchServeHandler:
             for tok in word_tokens:
                 token_to_orig_index.append(word_idx)
 
-        if len(tokens) > self.max_seq_length - self.special_tokens_count:
-            tokens = tokens[:(self.max_seq_length - self.special_tokens_count)]
+        if len(tokens) > self.max_seq_length - self.num_special_tokens:
+            tokens = tokens[:(self.max_seq_length - self.num_special_tokens)]
 
         tokens += [self.bert_tokenizer.sep_token]
         segment_ids = [0]*len(tokens)
@@ -235,76 +233,124 @@ class NERTorchServeHandler:
         )
         return feature
 
+    def prepare_data_for_input(self, sentence):
+        example = self.convert_sentence_to_example(sentence)
+        feature = self.convert_example_to_feature(example)
+        model_inputs = {
+            "input_ids": torch.tensor([feature.input_ids], dtype=torch.long),
+            "attention_mask": torch.tensor([feature.input_mask], dtype=torch.long),
+            "token_type_ids": torch.tensor([feature.segment_ids], dtype=torch.long),
+            "labels": None
+        }
+        return [model_inputs, example, feature]
 
+    def align_out_label_with_original_sentence_tokens(self, ner_labels, example, feature):
+        aligned_ner_labels = []
+        for i in range(len(feature.orig_to_token_index)):
+            token_idx = feature.orig_to_token_index[i]
+            if token_idx < (self.max_seq_length - self.num_special_tokens):
+                aligned_ner_labels.append(ner_labels[token_idx])
+            else:
+                aligned_ner_labels.append("O")
+        return aligned_ner_labels
 
+    def preprocess(self, data):
+        text = data[0].get("data")
+        if text is None:
+            text = data[0].get("body")
+        text = text.strip()
+        logger.info("Received text: '%s'", text)
+        model_inputs, example, feature = self.prepare_data_for_input(text)
+        return [model_inputs, example, feature]
 
-        self.model_config_path = model_config_path
-        self.labels_file = labels_file
-        self.device = device
-        if os.path.exists(self.model_config_path):
-            with open(self.model_config_path, "r", encoding="utf-8") as reader:
-                text = reader.read()
-            self.model_config_dict = json.loads(text)
-        else:
-            print("model_config_path doesn't exist.")
-            sys.exit()
+    def inference(self, inputs):
+        model_inputs, example, feature = inputs
+        logits, _, _ = self.model(**model_inputs)
+        return [logits, example, feature]
 
-        if os.path.exists(self.model_config_dict["final_model_saving_dir"]):
-            self.model_file = self.model_config_dict["final_model_saving_dir"] + "pytorch_model.bin"
-            self.config_file = self.model_config_dict["final_model_saving_dir"] + "bert_config.json"
-            self.vocab_file = self.model_config_dict["final_model_saving_dir"] + "vocab.txt"
-        else:
-            print("model_saving_dir doesn't exist.")
-            sys.exit()
-        if os.path.exists(self.labels_file):
-            print("Labels file exist")
-        else:
-            print("labels_file doesn't exist.")
-            sys.exit()
+    def postprocess(self, outputs):
+        out_label_ids, example, feature = outputs
+        prediction_label_ids = out_label_ids.detach().cpu().numpy().tolist()[0]
+        sentence_input_ids = feature.input_ids[1:]
+        sentence_ner_labels  = []
+        for i, (ner_label_id, token_id) in enumerate(zip(prediction_label_ids, sentence_input_ids)):
+            if token_id == self.bert_tokenizer.sep_token_id:
+                break
+            sentence_ner_labels.append(self.idx2label[ner_label_id])
 
-        self.bert_config = BertConfig.from_json_file(self.config_file)
-        self.bert_tokenizer = BertTokenizer.from_pretrained(
-            self.vocab_file,
-            config=self.bert_config,
-            do_lower_case=self.model_config_dict["tokenizer_do_lower_case"]
+        # aligning the labels with the real sentence tokens
+        aligned_ner_labels = self.align_out_label_with_original_sentence_tokens(
+            sentence_ner_labels, example, feature
         )
-        self.labels = get_labels(self.labels_file) + ["<PAD>"]
-        self.label2idx = {l: i for i, l in enumerate(self.labels)}
+        text, entities = self.convert_to_ents_dict(example.words, aligned_ner_labels)
+        return [text, entities]
 
-        self.model = BertForTokenClassification.from_pretrained(
-            self.model_file,
-            config=self.bert_config,
-            num_labels=len(self.labels),
-            classification_layer_sizes=self.model_config_dict["classification_layer_sizes"]
-        )
-        self.model.to(self.device)
-        print("Model loaded successfully from the config provided.")
+    def convert_to_ents_dict(self, tokens, tags):
+        start_offset = None
+        end_offset = None
+        ent_type = None
+        text = " ".join(tokens)
+        entities = []
+        start_char_offset = 0
+        for offset, (token, tag) in enumerate(zip(tokens, tags)):
+            token_tag = tag
+            if token_tag == "O":
+                if ent_type is not None and start_offset is not None:
+                    end_offset = offset - 1
+                    entity = {
+                        "type": ent_type,
+                        "entity": " ".join(tokens[start_offset: end_offset + 1]),
+                        "start_offset": start_char_offset,
+                        "end_offset": start_char_offset + len(" ".join(tokens[start_offset: end_offset + 1]))
+                    }
+                    entities.append(entity)
+                    start_char_offset += len(" ".join(tokens[start_offset: end_offset + 2])) + 1
+                    start_offset = None
+                    end_offset = None
+                    ent_type = None
+                else:
+                    start_char_offset += len(tokens) + 1
+            elif ent_type is None:
+                ent_type = token_tag[2:]
+                start_offset = offset
+            elif ent_type != token_tag[2:]:
+                end_offset = offset - 1
+                entity = {
+                    "type": ent_type,
+                    "entity": " ".join(tokens[start_offset: end_offset + 1]),
+                    "start_offset": start_char_offset,
+                    "end_offset": start_char_offset + len(" ".join(tokens[start_offset: end_offset + 1]))
+                }
+                entities.append(entity)
+                # start of a new entity
+                ent_type = token_tag[2:]
+                start_offset = offset
+                end_offset = None
 
-    def tag_sentences(self, sentence_list, logger, batch_size):
-        dataset, examples, features = load_and_cache_examples(
-            max_seq_length=self.model_config_dict["max_seq_length"],
-            tokenizer=self.bert_tokenizer,
-            label_map=self.label2idx,
-            pad_token_label_id=self.label2idx["<PAD>"],
-            mode="inference", data_dir=None,
-            logger=logger, sentence_list=sentence_list,
-            return_features_and_examples=True
-        )
+        # catches an entity that foes up untill the last token
+        if ent_type and start_offset is not None and end_offset is not None:
+            entity = {
+                "type": ent_type,
+                "entity": " ".join(tokens[start_offset:]),
+                "start_offset": start_char_offset,
+                "end_offset": start_char_offset + len(" ".join(tokens[start_offset:]))
+            }
+            entities.append(entity)
+        return text, entities
 
-        label_predictions = predictions_from_model(
-            model=self.model, tokenizer=self.bert_tokenizer,
-            dataset=dataset, batch_size=batch_size,
-            label2idx=self.label2idx, device=self.device
-        )
-        # restructure test_label_predictions with real labels
-        aligned_predicted_labels, _ = align_predicted_labels_with_original_sentence_tokens(
-            label_predictions, examples, features,
-            max_seq_length=self.model_config_dict["max_seq_length"],
-            num_special_tokens=self.model_config_dict["num_special_tokens"]
-        )
-        results = []
-        for label_tags, example in zip(aligned_predicted_labels, examples):
-            results.append(
-                convert_to_ents(example.words, label_tags)
-            )
-        return results
+
+_service = NERTorchServeHandler()
+
+
+def handle(data, context):
+    if not _service.initialized:
+        _service.initialized(context)
+
+    if data is None:
+        return None
+
+    data = _service.preprocess(data)
+    data = _service.inference(data)
+    data = _service.postprocess(data)
+
+    return data
