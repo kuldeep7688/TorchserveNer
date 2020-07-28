@@ -234,17 +234,6 @@ class NERTorchServeHandler:
         )
         return feature
 
-    def prepare_data_for_input(self, sentence):
-        example = self.convert_sentence_to_example(sentence)
-        feature = self.convert_example_to_feature(example)
-        model_inputs = {
-            "input_ids": torch.tensor([feature.input_ids], dtype=torch.long),
-            "attention_mask": torch.tensor([feature.input_mask], dtype=torch.long),
-            "token_type_ids": torch.tensor([feature.segment_ids], dtype=torch.long),
-            "labels": None
-        }
-        return [model_inputs, example, feature]
-
     def align_out_label_with_original_sentence_tokens(self, ner_labels, example, feature):
         aligned_ner_labels = []
         for i in range(len(feature.orig_to_token_index)):
@@ -256,15 +245,19 @@ class NERTorchServeHandler:
         return aligned_ner_labels
 
     def preprocess(self, data):
-        print("\n\n\n")
-        print(data)
-        print("\n\n\n")
         text = data[0].get("data")
         if text is None:
             text = data[0].get("body")
         text = text.decode('utf-8').strip()
         logger.info("Received text: '%s'", text)
-        model_inputs, example, feature = self.prepare_data_for_input(text)
+        example = self.convert_sentence_to_example(text)
+        feature = self.convert_example_to_feature(example)
+        model_inputs = {
+            "input_ids": torch.tensor([feature.input_ids], dtype=torch.long).to(self.device),
+            "attention_mask": torch.tensor([feature.input_mask], dtype=torch.long).to(self.device),
+            "token_type_ids": torch.tensor([feature.segment_ids], dtype=torch.long).to(self.device),
+            "labels": None
+        }
         return [model_inputs, example, feature]
 
     def inference(self, inputs):
@@ -313,7 +306,7 @@ class NERTorchServeHandler:
                     end_offset = None
                     ent_type = None
                 else:
-                    start_char_offset += len(tokens) + 1
+                    start_char_offset += len(token) + 1
             elif ent_type is None:
                 ent_type = token_tag[2:]
                 start_offset = offset
