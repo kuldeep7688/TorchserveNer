@@ -1,2 +1,2 @@
 # TorchserveNer
-deploying finetuned NER model using TorchServe
+Deploying finetuned NER model using TorchServe
