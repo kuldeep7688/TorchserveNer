@@ -256,11 +256,13 @@ class NERTorchServeHandler:
         return aligned_ner_labels
 
     def preprocess(self, data):
+        print("\n\n\n")
         print(data)
+        print("\n\n\n")
         text = data[0].get("data")
         if text is None:
             text = data[0].get("body")
-        text = text.strip()
+        text = text.decode('utf-8').strip()
         logger.info("Received text: '%s'", text)
         model_inputs, example, feature = self.prepare_data_for_input(text)
         return [model_inputs, example, feature]
@@ -285,7 +287,7 @@ class NERTorchServeHandler:
             sentence_ner_labels, example, feature
         )
         text, entities = self.convert_to_ents_dict(example.words, aligned_ner_labels)
-        return [text, entities]
+        return [[text, entities]]
 
     def convert_to_ents_dict(self, tokens, tags):
         start_offset = None
@@ -338,7 +340,7 @@ class NERTorchServeHandler:
                 "end_offset": start_char_offset + len(" ".join(tokens[start_offset:]))
             }
             entities.append(entity)
-        return text, entities
+        return [text, entities]
 
 
 _service = NERTorchServeHandler()
